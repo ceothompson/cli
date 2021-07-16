@@ -54,25 +54,43 @@ func (r Remotes) Less(i, j int) bool {
 	return remoteNameSortScore(r[i].Name) > remoteNameSortScore(r[j].Name)
 }
 
+// Filter remotes by given hostnames, maintains original order
+func (r Remotes) FilterByHosts(hosts []string) Remotes {
+	filtered := make(Remotes, 0)
+	for _, rr := range r {
+		for _, host := range hosts {
+			if strings.EqualFold(rr.RepoHost(), host) {
+				filtered = append(filtered, rr)
+				break
+			}
+		}
+	}
+	return filtered
+}
+
 // Remote represents a git remote mapped to a GitHub repository
 type Remote struct {
 	*git.Remote
-	Owner string
-	Repo  string
+	Repo ghrepo.Interface
 }
 
 // RepoName is the name of the GitHub repository
 func (r Remote) RepoName() string {
-	return r.Repo
+	return r.Repo.RepoName()
 }
 
 // RepoOwner is the name of the GitHub account that owns the repo
 func (r Remote) RepoOwner() string {
-	return r.Owner
+	return r.Repo.RepoOwner()
+}
+
+// RepoHost is the GitHub hostname that the remote points to
+func (r Remote) RepoHost() string {
+	return r.Repo.RepoHost()
 }
 
 // TODO: accept an interface instead of git.RemoteSet
-func translateRemotes(gitRemotes git.RemoteSet, urlTranslate func(*url.URL) *url.URL) (remotes Remotes) {
+func TranslateRemotes(gitRemotes git.RemoteSet, urlTranslate func(*url.URL) *url.URL) (remotes Remotes) {
 	for _, r := range gitRemotes {
 		var repo ghrepo.Interface
 		if r.FetchURL != nil {
@@ -86,8 +104,7 @@ func translateRemotes(gitRemotes git.RemoteSet, urlTranslate func(*url.URL) *url
 		}
 		remotes = append(remotes, &Remote{
 			Remote: r,
-			Owner:  repo.RepoOwner(),
-			Repo:   repo.RepoName(),
+			Repo:   repo,
 		})
 	}
 	return

@@ -1,51 +1,15 @@
 package api
 
 import (
-	"bytes"
-	"encoding/json"
-	"io/ioutil"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/cli/cli/internal/ghrepo"
 	"github.com/cli/cli/pkg/httpmock"
 )
 
-func Test_RepoCreate(t *testing.T) {
-	http := &httpmock.Registry{}
-	client := NewClient(ReplaceTripper(http))
-
-	http.StubResponse(200, bytes.NewBufferString(`{}`))
-
-	input := RepoCreateInput{
-		Description: "roasted chesnuts",
-		HomepageURL: "http://example.com",
-	}
-
-	_, err := RepoCreate(client, input)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(http.Requests) != 1 {
-		t.Fatalf("expected 1 HTTP request, seen %d", len(http.Requests))
-	}
-
-	var reqBody struct {
-		Query     string
-		Variables struct {
-			Input map[string]interface{}
-		}
-	}
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[0].Body)
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-	if description := reqBody.Variables.Input["description"].(string); description != "roasted chesnuts" {
-		t.Errorf("expected description to be %q, got %q", "roasted chesnuts", description)
-	}
-	if homepage := reqBody.Variables.Input["homepageUrl"].(string); homepage != "http://example.com" {
-		t.Errorf("expected homepageUrl to be %q, got %q", "http://example.com", homepage)
-	}
-}
 func Test_RepoMetadata(t *testing.T) {
 	http := &httpmock.Registry{}
 	client := NewClient(ReplaceTripper(http))
@@ -60,7 +24,7 @@ func Test_RepoMetadata(t *testing.T) {
 	}
 
 	http.Register(
-		httpmock.GraphQL(`\bassignableUsers\(`),
+		httpmock.GraphQL(`query RepositoryAssignableUsers\b`),
 		httpmock.StringResponse(`
 		{ "data": { "repository": { "assignableUsers": {
 			"nodes": [
@@ -71,7 +35,7 @@ func Test_RepoMetadata(t *testing.T) {
 		} } } }
 		`))
 	http.Register(
-		httpmock.GraphQL(`\blabels\(`),
+		httpmock.GraphQL(`query RepositoryLabelList\b`),
 		httpmock.StringResponse(`
 		{ "data": { "repository": { "labels": {
 			"nodes": [
@@ -83,7 +47,7 @@ func Test_RepoMetadata(t *testing.T) {
 		} } } }
 		`))
 	http.Register(
-		httpmock.GraphQL(`\bmilestones\(`),
+		httpmock.GraphQL(`query RepositoryMilestoneList\b`),
 		httpmock.StringResponse(`
 		{ "data": { "repository": { "milestones": {
 			"nodes": [
@@ -94,7 +58,7 @@ func Test_RepoMetadata(t *testing.T) {
 		} } } }
 		`))
 	http.Register(
-		httpmock.GraphQL(`\brepository\(.+\bprojects\(`),
+		httpmock.GraphQL(`query RepositoryProjectList\b`),
 		httpmock.StringResponse(`
 		{ "data": { "repository": { "projects": {
 			"nodes": [
@@ -105,7 +69,7 @@ func Test_RepoMetadata(t *testing.T) {
 		} } } }
 		`))
 	http.Register(
-		httpmock.GraphQL(`\borganization\(.+\bprojects\(`),
+		httpmock.GraphQL(`query OrganizationProjectList\b`),
 		httpmock.StringResponse(`
 		{ "data": { "organization": { "projects": {
 			"nodes": [
@@ -115,7 +79,7 @@ func Test_RepoMetadata(t *testing.T) {
 		} } } }
 		`))
 	http.Register(
-		httpmock.GraphQL(`\borganization\(.+\bteams\(`),
+		httpmock.GraphQL(`query OrganizationTeamList\b`),
 		httpmock.StringResponse(`
 		{ "data": { "organization": { "teams": {
 			"nodes": [
@@ -177,6 +141,63 @@ func Test_RepoMetadata(t *testing.T) {
 	}
 }
 
+func Test_ProjectsToPaths(t *testing.T) {
+	expectedProjectPaths := []string{"OWNER/REPO/PROJECT_NUMBER", "ORG/PROJECT_NUMBER"}
+	projects := []RepoProject{
+		{ID: "id1", Name: "My Project", ResourcePath: "/OWNER/REPO/projects/PROJECT_NUMBER"},
+		{ID: "id2", Name: "Org Project", ResourcePath: "/orgs/ORG/projects/PROJECT_NUMBER"},
+		{ID: "id3", Name: "Project", ResourcePath: "/orgs/ORG/projects/PROJECT_NUMBER_2"},
+	}
+	projectNames := []string{"My Project", "Org Project"}
+
+	projectPaths, err := ProjectsToPaths(projects, projectNames)
+	if err != nil {
+		t.Errorf("error resolving projects: %v", err)
+	}
+	if !sliceEqual(projectPaths, expectedProjectPaths) {
+		t.Errorf("expected projects %v, got %v", expectedProjectPaths, projectPaths)
+	}
+}
+
+func Test_ProjectNamesToPaths(t *testing.T) {
+	http := &httpmock.Registry{}
+	client := NewClient(ReplaceTripper(http))
+
+	repo, _ := ghrepo.FromFullName("OWNER/REPO")
+
+	http.Register(
+		httpmock.GraphQL(`query RepositoryProjectList\b`),
+		httpmock.StringResponse(`
+		{ "data": { "repository": { "projects": {
+			"nodes": [
+				{ "name": "Cleanup", "id": "CLEANUPID", "resourcePath": "/OWNER/REPO/projects/1" },
+				{ "name": "Roadmap", "id": "ROADMAPID", "resourcePath": "/OWNER/REPO/projects/2" }
+			],
+			"pageInfo": { "hasNextPage": false }
+		} } } }
+		`))
+	http.Register(
+		httpmock.GraphQL(`query OrganizationProjectList\b`),
+		httpmock.StringResponse(`
+			{ "data": { "organization": { "projects": {
+				"nodes": [
+					{ "name": "Triage", "id": "TRIAGEID", "resourcePath": "/orgs/ORG/projects/1"  }
+				],
+				"pageInfo": { "hasNextPage": false }
+			} } } }
+			`))
+
+	projectPaths, err := ProjectNamesToPaths(client, repo, []string{"Triage", "Roadmap"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expectedProjectPaths := []string{"ORG/1", "OWNER/REPO/2"}
+	if !sliceEqual(projectPaths, expectedProjectPaths) {
+		t.Errorf("expected projects paths %v, got %v", expectedProjectPaths, projectPaths)
+	}
+}
+
 func Test_RepoResolveMetadataIDs(t *testing.T) {
 	http := &httpmock.Registry{}
 	client := NewClient(ReplaceTripper(http))
@@ -188,7 +209,7 @@ func Test_RepoResolveMetadataIDs(t *testing.T) {
 		Labels:    []string{"bug", "help wanted"},
 	}
 
-	expectedQuery := `{
+	expectedQuery := `query RepositoryResolveMetadataIDs {
 u000: user(login:"monalisa"){id,login}
 u001: user(login:"hubot"){id,login}
 u002: user(login:"octocat"){id,login}
@@ -219,7 +240,7 @@ t001: team(slug:"robots"){id,slug}
 	`
 
 	http.Register(
-		httpmock.MatchAny,
+		httpmock.GraphQL(`query RepositoryResolveMetadataIDs\b`),
 		httpmock.GraphQLQuery(responseJSON, func(q string, _ map[string]interface{}) {
 			if q != expectedQuery {
 				t.Errorf("expected query %q, got %q", expectedQuery, q)
@@ -271,4 +292,52 @@ func sliceEqual(a, b []string) bool {
 	}
 
 	return true
+}
+
+func Test_RepoMilestones(t *testing.T) {
+	tests := []struct {
+		state   string
+		want    string
+		wantErr bool
+	}{
+		{
+			state: "open",
+			want:  `"states":["OPEN"]`,
+		},
+		{
+			state: "closed",
+			want:  `"states":["CLOSED"]`,
+		},
+		{
+			state: "all",
+			want:  `"states":["OPEN","CLOSED"]`,
+		},
+		{
+			state:   "invalid state",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		var query string
+		reg := &httpmock.Registry{}
+		reg.Register(httpmock.MatchAny, func(req *http.Request) (*http.Response, error) {
+			buf := new(strings.Builder)
+			_, err := io.Copy(buf, req.Body)
+			if err != nil {
+				return nil, err
+			}
+			query = buf.String()
+			return httpmock.StringResponse("{}")(req)
+		})
+		client := NewClient(ReplaceTripper(reg))
+
+		_, err := RepoMilestones(client, ghrepo.New("OWNER", "REPO"), tt.state)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("RepoMilestones() error = %v, wantErr %v", err, tt.wantErr)
+			return
+		}
+		if !strings.Contains(query, tt.want) {
+			t.Errorf("query does not contain %v", tt.want)
+		}
+	}
 }

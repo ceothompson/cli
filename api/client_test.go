@@ -2,19 +2,14 @@ package api
 
 import (
 	"bytes"
+	"errors"
 	"io/ioutil"
-	"reflect"
+	"net/http"
 	"testing"
 
 	"github.com/cli/cli/pkg/httpmock"
+	"github.com/stretchr/testify/assert"
 )
-
-func eq(t *testing.T, got interface{}, expected interface{}) {
-	t.Helper()
-	if !reflect.DeepEqual(got, expected) {
-		t.Errorf("expected: %v, got: %v", expected, got)
-	}
-}
 
 func TestGraphQL(t *testing.T) {
 	http := &httpmock.Registry{}
@@ -30,15 +25,19 @@ func TestGraphQL(t *testing.T) {
 		}
 	}{}
 
-	http.StubResponse(200, bytes.NewBufferString(`{"data":{"viewer":{"login":"hubot"}}}`))
-	err := client.GraphQL("QUERY", vars, &response)
-	eq(t, err, nil)
-	eq(t, response.Viewer.Login, "hubot")
+	http.Register(
+		httpmock.GraphQL("QUERY"),
+		httpmock.StringResponse(`{"data":{"viewer":{"login":"hubot"}}}`),
+	)
+
+	err := client.GraphQL("github.com", "QUERY", vars, &response)
+	assert.NoError(t, err)
+	assert.Equal(t, "hubot", response.Viewer.Login)
 
 	req := http.Requests[0]
 	reqBody, _ := ioutil.ReadAll(req.Body)
-	eq(t, string(reqBody), `{"query":"QUERY","variables":{"name":"Mona"}}`)
-	eq(t, req.Header.Get("Authorization"), "token OTOKEN")
+	assert.Equal(t, `{"query":"QUERY","variables":{"name":"Mona"}}`, string(reqBody))
+	assert.Equal(t, "token OTOKEN", req.Header.Get("Authorization"))
 }
 
 func TestGraphQLError(t *testing.T) {
@@ -46,9 +45,20 @@ func TestGraphQLError(t *testing.T) {
 	client := NewClient(ReplaceTripper(http))
 
 	response := struct{}{}
-	http.StubResponse(200, bytes.NewBufferString(`{"errors":[{"message":"OH NO"}]}`))
-	err := client.GraphQL("", nil, &response)
-	if err == nil || err.Error() != "graphql error: 'OH NO'" {
+
+	http.Register(
+		httpmock.GraphQL(""),
+		httpmock.StringResponse(`
+			{ "errors": [
+				{"message":"OH NO"},
+				{"message":"this is fine"}
+			  ]
+			}
+		`),
+	)
+
+	err := client.GraphQL("github.com", "", nil, &response)
+	if err == nil || err.Error() != "GraphQL error: OH NO\nthis is fine" {
 		t.Fatalf("got %q", err.Error())
 	}
 }
@@ -60,9 +70,62 @@ func TestRESTGetDelete(t *testing.T) {
 		ReplaceTripper(http),
 	)
 
-	http.StubResponse(204, bytes.NewBuffer([]byte{}))
+	http.Register(
+		httpmock.REST("DELETE", "applications/CLIENTID/grant"),
+		httpmock.StatusStringResponse(204, "{}"),
+	)
 
 	r := bytes.NewReader([]byte(`{}`))
-	err := client.REST("DELETE", "applications/CLIENTID/grant", r, nil)
-	eq(t, err, nil)
+	err := client.REST("github.com", "DELETE", "applications/CLIENTID/grant", r, nil)
+	assert.NoError(t, err)
+}
+
+func TestRESTWithFullURL(t *testing.T) {
+	http := &httpmock.Registry{}
+	client := NewClient(ReplaceTripper(http))
+
+	http.Register(
+		httpmock.REST("GET", "api/v3/user/repos"),
+		httpmock.StatusStringResponse(200, "{}"))
+	http.Register(
+		httpmock.REST("GET", "user/repos"),
+		httpmock.StatusStringResponse(200, "{}"))
+
+	err := client.REST("example.com", "GET", "user/repos", nil, nil)
+	assert.NoError(t, err)
+	err = client.REST("example.com", "GET", "https://another.net/user/repos", nil, nil)
+	assert.NoError(t, err)
+
+	assert.Equal(t, "example.com", http.Requests[0].URL.Hostname())
+	assert.Equal(t, "another.net", http.Requests[1].URL.Hostname())
+}
+
+func TestRESTError(t *testing.T) {
+	fakehttp := &httpmock.Registry{}
+	client := NewClient(ReplaceTripper(fakehttp))
+
+	fakehttp.Register(httpmock.MatchAny, func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			Request:    req,
+			StatusCode: 422,
+			Body:       ioutil.NopCloser(bytes.NewBufferString(`{"message": "OH NO"}`)),
+			Header: map[string][]string{
+				"Content-Type": {"application/json; charset=utf-8"},
+			},
+		}, nil
+	})
+
+	var httpErr HTTPError
+	err := client.REST("github.com", "DELETE", "repos/branch", nil, nil)
+	if err == nil || !errors.As(err, &httpErr) {
+		t.Fatalf("got %v", err)
+	}
+
+	if httpErr.StatusCode != 422 {
+		t.Errorf("expected status code 422, got %d", httpErr.StatusCode)
+	}
+	if httpErr.Error() != "HTTP 422: OH NO (https://api.github.com/repos/branch)" {
+		t.Errorf("got %q", httpErr.Error())
+
+	}
 }

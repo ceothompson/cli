@@ -1,6 +1,7 @@
 package githubtemplate
 
 import (
+	"fmt"
 	"io/ioutil"
 	"path"
 	"regexp"
@@ -10,8 +11,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Find returns the list of template file paths
-func Find(rootDir string, name string) []string {
+// FindNonLegacy returns the list of template file paths from the template folder (according to the "upgraded multiple template builder")
+func FindNonLegacy(rootDir string, name string) []string {
 	results := []string{}
 
 	// https://help.github.com/en/github/building-a-strong-community/creating-a-pull-request-template-for-your-repository
@@ -46,21 +47,35 @@ mainLoop:
 				break
 			}
 		}
+	}
+	sort.Strings(results)
+	return results
+}
+
+// FindLegacy returns the file path of the default(legacy) template
+func FindLegacy(rootDir string, name string) string {
+	namePattern := regexp.MustCompile(fmt.Sprintf(`(?i)^%s(\.|$)`, strings.ReplaceAll(name, "_", "[_-]")))
+
+	// https://help.github.com/en/github/building-a-strong-community/creating-a-pull-request-template-for-your-repository
+	candidateDirs := []string{
+		path.Join(rootDir, ".github"),
+		rootDir,
+		path.Join(rootDir, "docs"),
+	}
+	for _, dir := range candidateDirs {
+		files, err := ioutil.ReadDir(dir)
+		if err != nil {
+			continue
+		}
 
 		// detect a single template file
 		for _, file := range files {
-			if strings.EqualFold(file.Name(), name+".md") {
-				results = append(results, path.Join(dir, file.Name()))
-				break
+			if namePattern.MatchString(file.Name()) && !file.IsDir() {
+				return path.Join(dir, file.Name())
 			}
 		}
-		if len(results) > 0 {
-			break
-		}
 	}
-
-	sort.Strings(results)
-	return results
+	return ""
 }
 
 // ExtractName returns the name of the template from YAML front-matter
