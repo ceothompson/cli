@@ -3,72 +3,84 @@ package view
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strconv"
 	"time"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/browser"
 	"github.com/cli/cli/v2/internal/ghinstance"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmd/run/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
-	"github.com/cli/cli/v2/utils"
 	"github.com/spf13/cobra"
 )
 
-type browser interface {
-	Browse(string) error
+type RunLogCache struct {
+	cacheDir string
 }
 
-type runLogCache interface {
-	Exists(string) bool
-	Create(string, io.ReadCloser) error
-	Open(string) (*zip.ReadCloser, error)
-}
-
-type rlc struct{}
-
-func (rlc) Exists(path string) bool {
-	if _, err := os.Stat(path); err != nil {
-		return false
-	}
-	return true
-}
-func (rlc) Create(path string, content io.ReadCloser) error {
-	err := os.MkdirAll(filepath.Dir(path), 0755)
-	if err != nil {
-		return fmt.Errorf("could not create cache: %w", err)
+func (c RunLogCache) Exists(key string) (bool, error) {
+	_, err := os.Stat(c.filepath(key))
+	if err == nil {
+		return true, nil
 	}
 
-	out, err := os.Create(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+
+	return false, fmt.Errorf("checking cache entry: %v", err)
+}
+
+func (c RunLogCache) Create(key string, content io.Reader) error {
+	if err := os.MkdirAll(c.cacheDir, 0755); err != nil {
+		return fmt.Errorf("creating cache directory: %v", err)
+	}
+
+	out, err := os.Create(c.filepath(key))
 	if err != nil {
-		return err
+		return fmt.Errorf("creating cache entry: %v", err)
 	}
 	defer out.Close()
-	_, err = io.Copy(out, content)
-	return err
+
+	if _, err := io.Copy(out, content); err != nil {
+		return fmt.Errorf("writing cache entry: %v", err)
+
+	}
+
+	return nil
 }
-func (rlc) Open(path string) (*zip.ReadCloser, error) {
-	return zip.OpenReader(path)
+
+func (c RunLogCache) Open(key string) (*zip.ReadCloser, error) {
+	r, err := zip.OpenReader(c.filepath(key))
+	if err != nil {
+		return nil, fmt.Errorf("opening cache entry: %v", err)
+	}
+
+	return r, nil
+}
+
+func (c RunLogCache) filepath(key string) string {
+	return filepath.Join(c.cacheDir, fmt.Sprintf("run-log-%s.zip", key))
 }
 
 type ViewOptions struct {
 	HttpClient  func() (*http.Client, error)
 	IO          *iostreams.IOStreams
 	BaseRepo    func() (ghrepo.Interface, error)
-	Browser     browser
-	RunLogCache runLogCache
+	Browser     browser.Browser
+	Prompter    shared.Prompter
+	RunLogCache RunLogCache
 
 	RunID      string
 	JobID      string
@@ -77,31 +89,50 @@ type ViewOptions struct {
 	Log        bool
 	LogFailed  bool
 	Web        bool
+	Attempt    uint64
 
-	Prompt bool
+	Prompt   bool
+	Exporter cmdutil.Exporter
 
 	Now func() time.Time
 }
 
 func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Command {
 	opts := &ViewOptions{
-		IO:          f.IOStreams,
-		HttpClient:  f.HttpClient,
-		Now:         time.Now,
-		Browser:     f.Browser,
-		RunLogCache: rlc{},
+		IO:         f.IOStreams,
+		HttpClient: f.HttpClient,
+		Prompter:   f.Prompter,
+		Now:        time.Now,
+		Browser:    f.Browser,
 	}
 
 	cmd := &cobra.Command{
 		Use:   "view [<run-id>]",
 		Short: "View a summary of a workflow run",
-		Args:  cobra.MaximumNArgs(1),
+		Long: heredoc.Docf(`
+			View a summary of a workflow run.
+
+			Due to platform limitations, %[1]sgh%[1]s may not always be able to associate jobs with their
+			corresponding logs when using the primary method of fetching logs in zip format.
+
+			In such cases, %[1]sgh%[1]s will attempt to fetch logs for each job individually via the API.
+			This fallback is slower and more resource-intensive. If more than 25 job logs are missing,
+			the operation will fail with an error.
+
+			Additionally, due to similar platform constraints, some log lines may not be
+			associated with a specific step within a job. In these cases, the step name will
+			appear as %[1]sUNKNOWN STEP%[1]s in the log output.
+		`, "`", maxAPILogFetchers),
+		Args: cobra.MaximumNArgs(1),
 		Example: heredoc.Doc(`
 			# Interactively select a run to view, optionally selecting a single job
 			$ gh run view
 
 			# View a specific run
 			$ gh run view 12345
+
+			# View a specific run with specific attempt number
+			$ gh run view 12345 --attempt 3
 
 			# View a specific job within a run
 			$ gh run view --job 456789
@@ -116,9 +147,18 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 			// support `-R, --repo` override
 			opts.BaseRepo = f.BaseRepo
 
+			config, err := f.Config()
+			if err != nil {
+				return err
+			}
+
+			opts.RunLogCache = RunLogCache{
+				cacheDir: config.CacheDir(),
+			}
+
 			if len(args) == 0 && opts.JobID == "" {
 				if !opts.IO.CanPrompt() {
-					return &cmdutil.FlagError{Err: errors.New("run or job ID required when not running interactively")}
+					return cmdutil.FlagErrorf("run or job ID required when not running interactively")
 				} else {
 					opts.Prompt = true
 				}
@@ -135,11 +175,11 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 			}
 
 			if opts.Web && opts.Log {
-				return &cmdutil.FlagError{Err: errors.New("specify only one of --web or --log")}
+				return cmdutil.FlagErrorf("specify only one of --web or --log")
 			}
 
 			if opts.Log && opts.LogFailed {
-				return &cmdutil.FlagError{Err: errors.New("specify only one of --log or --log-failed")}
+				return cmdutil.FlagErrorf("specify only one of --log or --log-failed")
 			}
 
 			if runF != nil {
@@ -155,6 +195,8 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 	cmd.Flags().BoolVar(&opts.Log, "log", false, "View full log for either a run or specific job")
 	cmd.Flags().BoolVar(&opts.LogFailed, "log-failed", false, "View the log for any failed steps in a run or specific job")
 	cmd.Flags().BoolVarP(&opts.Web, "web", "w", false, "Open run in the browser")
+	cmd.Flags().Uint64VarP(&opts.Attempt, "attempt", "a", 0, "The attempt number of the workflow run")
+	cmdutil.AddJSONFlags(cmd, &opts.Exporter, shared.SingleRunFields)
 
 	return cmd
 }
@@ -173,6 +215,7 @@ func runView(opts *ViewOptions) error {
 
 	jobID := opts.JobID
 	runID := opts.RunID
+	attempt := opts.Attempt
 	var selectedJob *shared.Job
 	var run *shared.Run
 	var jobs []shared.Job
@@ -181,7 +224,7 @@ func runView(opts *ViewOptions) error {
 
 	if jobID != "" {
 		opts.IO.StartProgressIndicator()
-		selectedJob, err = getJob(client, repo, jobID)
+		selectedJob, err = shared.GetJob(client, repo, jobID)
 		opts.IO.StopProgressIndicator()
 		if err != nil {
 			return fmt.Errorf("failed to get job: %w", err)
@@ -195,37 +238,48 @@ func runView(opts *ViewOptions) error {
 	if opts.Prompt {
 		// TODO arbitrary limit
 		opts.IO.StartProgressIndicator()
-		runs, err := shared.GetRuns(client, repo, 10)
+		runs, err := shared.GetRuns(client, repo, nil, 10)
 		opts.IO.StopProgressIndicator()
 		if err != nil {
 			return fmt.Errorf("failed to get runs: %w", err)
 		}
-		runID, err = shared.PromptForRun(cs, runs)
+		runID, err = shared.SelectRun(opts.Prompter, cs, runs.WorkflowRuns)
 		if err != nil {
 			return err
 		}
 	}
 
 	opts.IO.StartProgressIndicator()
-	run, err = shared.GetRun(client, repo, runID)
+	run, err = shared.GetRun(client, repo, runID, attempt)
 	opts.IO.StopProgressIndicator()
 	if err != nil {
 		return fmt.Errorf("failed to get run: %w", err)
 	}
 
-	if opts.Prompt {
+	if shouldFetchJobs(opts) {
 		opts.IO.StartProgressIndicator()
-		jobs, err = shared.GetJobs(client, repo, *run)
+		jobs, err = shared.GetJobs(client, repo, run, attempt)
 		opts.IO.StopProgressIndicator()
 		if err != nil {
 			return err
 		}
-		if len(jobs) > 1 {
-			selectedJob, err = promptForJob(cs, jobs)
-			if err != nil {
-				return err
-			}
+	}
+
+	if opts.Prompt && len(jobs) > 1 {
+		selectedJob, err = promptForJob(opts.Prompter, cs, jobs)
+		if err != nil {
+			return err
 		}
+	}
+
+	if err := opts.IO.StartPager(); err == nil {
+		defer opts.IO.StopPager()
+	} else {
+		fmt.Fprintf(opts.IO.ErrOut, "failed to start pager: %v\n", err)
+	}
+
+	if opts.Exporter != nil {
+		return opts.Exporter.Write(opts.IO, run)
 	}
 
 	if opts.Web {
@@ -234,7 +288,7 @@ func runView(opts *ViewOptions) error {
 			url = selectedJob.URL + "?check_suite_focus=true"
 		}
 		if opts.IO.IsStdoutTTY() {
-			fmt.Fprintf(opts.IO.Out, "Opening %s in your browser.\n", utils.DisplayURL(url))
+			fmt.Fprintf(opts.IO.Out, "Opening %s in your browser.\n", text.DisplayURL(url))
 		}
 
 		return opts.Browser.Browse(url)
@@ -242,7 +296,7 @@ func runView(opts *ViewOptions) error {
 
 	if selectedJob == nil && len(jobs) == 0 {
 		opts.IO.StartProgressIndicator()
-		jobs, err = shared.GetJobs(client, repo, *run)
+		jobs, err = shared.GetJobs(client, repo, run, attempt)
 		opts.IO.StopProgressIndicator()
 		if err != nil {
 			return fmt.Errorf("failed to get jobs: %w", err)
@@ -261,22 +315,29 @@ func runView(opts *ViewOptions) error {
 		}
 
 		opts.IO.StartProgressIndicator()
-		runLogZip, err := getRunLog(opts.RunLogCache, httpClient, repo, run)
+		runLogZip, err := getRunLog(opts.RunLogCache, httpClient, repo, run, attempt)
 		opts.IO.StopProgressIndicator()
 		if err != nil {
 			return fmt.Errorf("failed to get run log: %w", err)
 		}
 		defer runLogZip.Close()
 
-		attachRunLog(runLogZip, jobs)
+		zlm := getZipLogMap(&runLogZip.Reader, jobs)
+		segments, err := populateLogSegments(httpClient, repo, jobs, zlm, opts.LogFailed)
+		if err != nil {
+			if errors.Is(err, errTooManyAPILogFetchers) {
+				return fmt.Errorf("too many API requests needed to fetch logs; try narrowing down to a specific job with the `--job` option")
+			}
+			return err
+		}
 
-		return displayRunLog(opts.IO, jobs, opts.LogFailed)
+		return displayLogSegments(opts.IO.Out, segments)
 	}
 
 	prNumber := ""
 	number, err := shared.PullRequestForRun(client, repo, *run)
 	if err == nil {
-		prNumber = fmt.Sprintf(" #%d", number)
+		prNumber = fmt.Sprintf(" %s#%d", ghrepo.FullName(repo), number)
 	}
 
 	var artifacts []shared.Artifact
@@ -288,29 +349,25 @@ func runView(opts *ViewOptions) error {
 	}
 
 	var annotations []shared.Annotation
+	var missingAnnotationsPermissions bool
 
-	var annotationErr error
-	var as []shared.Annotation
 	for _, job := range jobs {
-		as, annotationErr = shared.GetAnnotations(client, repo, job)
-		if annotationErr != nil {
+		as, err := shared.GetAnnotations(client, repo, job)
+		if err != nil {
+			if err != shared.ErrMissingAnnotationsPermissions {
+				return fmt.Errorf("failed to get annotations: %w", err)
+			}
+
+			missingAnnotationsPermissions = true
 			break
 		}
 		annotations = append(annotations, as...)
 	}
 
-	opts.IO.StopProgressIndicator()
-
-	if annotationErr != nil {
-		return fmt.Errorf("failed to get annotations: %w", annotationErr)
-	}
-
 	out := opts.IO.Out
 
-	ago := opts.Now().Sub(run.CreatedAt)
-
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, shared.RenderRunHeader(cs, *run, utils.FuzzyAgo(ago), prNumber))
+	fmt.Fprintln(out, shared.RenderRunHeader(cs, *run, text.FuzzyAgo(opts.Now(), run.StartedTime()), prNumber, attempt))
 	fmt.Fprintln(out)
 
 	if len(jobs) == 0 && run.Conclusion == shared.Failure || run.Conclusion == shared.StartupFailure {
@@ -334,7 +391,11 @@ func runView(opts *ViewOptions) error {
 		fmt.Fprintln(out, shared.RenderJobs(cs, jobs, true))
 	}
 
-	if len(annotations) > 0 {
+	if missingAnnotationsPermissions {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, cs.Bold("ANNOTATIONS"))
+		fmt.Fprintln(out, "requesting annotations returned 403 Forbidden as the token does not have sufficient permissions. Note that it is not currently possible to create a fine-grained PAT with the `checks:read` permission.")
+	} else if len(annotations) > 0 {
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, cs.Bold("ANNOTATIONS"))
 		fmt.Fprintln(out, shared.RenderAnnotations(cs, annotations))
@@ -347,7 +408,7 @@ func runView(opts *ViewOptions) error {
 			for _, a := range artifacts {
 				expiredBadge := ""
 				if a.Expired {
-					expiredBadge = cs.Gray(" (expired)")
+					expiredBadge = cs.Muted(" (expired)")
 				}
 				fmt.Fprintf(out, "%s%s\n", a.Name, expiredBadge)
 			}
@@ -356,10 +417,12 @@ func runView(opts *ViewOptions) error {
 		fmt.Fprintln(out)
 		if shared.IsFailureState(run.Conclusion) {
 			fmt.Fprintf(out, "To see what failed, try: gh run view %d --log-failed\n", run.ID)
+		} else if len(jobs) == 1 {
+			fmt.Fprintf(out, "For more information about the job, try: gh run view --job=%d\n", jobs[0].ID)
 		} else {
-			fmt.Fprintln(out, "For more information about a job, try: gh run view --job=<job-id>")
+			fmt.Fprintf(out, "For more information about a job, try: gh run view --job=<job-id>\n")
 		}
-		fmt.Fprintf(out, cs.Gray("View this run on GitHub: %s\n"), run.URL)
+		fmt.Fprintln(out, cs.Mutedf("View this run on GitHub: %s", run.URL))
 
 		if opts.ExitStatus && shared.IsFailureState(run.Conclusion) {
 			return cmdutil.SilentError
@@ -371,7 +434,7 @@ func runView(opts *ViewOptions) error {
 		} else {
 			fmt.Fprintf(out, "To see the full job log, try: gh run view --log --job=%d\n", selectedJob.ID)
 		}
-		fmt.Fprintf(out, cs.Gray("View this run on GitHub: %s\n"), run.URL)
+		fmt.Fprintln(out, cs.Mutedf("View this run on GitHub: %s", run.URL))
 
 		if opts.ExitStatus && shared.IsFailureState(selectedJob.Conclusion) {
 			return cmdutil.SilentError
@@ -381,16 +444,18 @@ func runView(opts *ViewOptions) error {
 	return nil
 }
 
-func getJob(client *api.Client, repo ghrepo.Interface, jobID string) (*shared.Job, error) {
-	path := fmt.Sprintf("repos/%s/actions/jobs/%s", ghrepo.FullName(repo), jobID)
-
-	var result shared.Job
-	err := client.REST(repo.RepoHost(), "GET", path, nil, &result)
-	if err != nil {
-		return nil, err
+func shouldFetchJobs(opts *ViewOptions) bool {
+	if opts.Prompt {
+		return true
 	}
-
-	return &result, nil
+	if opts.Exporter != nil {
+		for _, f := range opts.Exporter.Fields() {
+			if f == "jobs" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func getLog(httpClient *http.Client, logURL string) (io.ReadCloser, error) {
@@ -413,13 +478,22 @@ func getLog(httpClient *http.Client, logURL string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
-func getRunLog(cache runLogCache, httpClient *http.Client, repo ghrepo.Interface, run *shared.Run) (*zip.ReadCloser, error) {
-	filename := fmt.Sprintf("run-log-%d-%d.zip", run.ID, run.CreatedAt.Unix())
-	filepath := filepath.Join(os.TempDir(), "gh-cli-cache", filename)
-	if !cache.Exists(filepath) {
+func getRunLog(cache RunLogCache, httpClient *http.Client, repo ghrepo.Interface, run *shared.Run, attempt uint64) (*zip.ReadCloser, error) {
+	cacheKey := fmt.Sprintf("%d-%d", run.ID, run.StartedTime().Unix())
+	isCached, err := cache.Exists(cacheKey)
+	if err != nil {
+		return nil, err
+	}
+
+	if !isCached {
 		// Run log does not exist in cache so retrieve and store it
 		logURL := fmt.Sprintf("%srepos/%s/actions/runs/%d/logs",
 			ghinstance.RESTPrefix(repo.RepoHost()), ghrepo.FullName(repo), run.ID)
+
+		if attempt > 0 {
+			logURL = fmt.Sprintf("%srepos/%s/actions/runs/%d/attempts/%d/logs",
+				ghinstance.RESTPrefix(repo.RepoHost()), ghrepo.FullName(repo), run.ID, attempt)
+		}
 
 		resp, err := getLog(httpClient, logURL)
 		if err != nil {
@@ -427,28 +501,35 @@ func getRunLog(cache runLogCache, httpClient *http.Client, repo ghrepo.Interface
 		}
 		defer resp.Close()
 
-		err = cache.Create(filepath, resp)
+		data, err := io.ReadAll(resp)
+		if err != nil {
+			return nil, err
+		}
+		respReader := bytes.NewReader(data)
+
+		// Check if the response is a valid zip format
+		_, err = zip.NewReader(respReader, respReader.Size())
+		if err != nil {
+			return nil, err
+		}
+
+		err = cache.Create(cacheKey, respReader)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return cache.Open(filepath)
+	return cache.Open(cacheKey)
 }
 
-func promptForJob(cs *iostreams.ColorScheme, jobs []shared.Job) (*shared.Job, error) {
+func promptForJob(prompter shared.Prompter, cs *iostreams.ColorScheme, jobs []shared.Job) (*shared.Job, error) {
 	candidates := []string{"View all jobs in this run"}
 	for _, job := range jobs {
 		symbol, _ := shared.Symbol(cs, job.Status, job.Conclusion)
 		candidates = append(candidates, fmt.Sprintf("%s %s", symbol, job.Name))
 	}
 
-	var selected int
-	err := prompt.SurveyAskOne(&survey.Select{
-		Message:  "View a specific job in this run?",
-		Options:  candidates,
-		PageSize: 12,
-	}, &selected)
+	selected, err := prompter.Select("View a specific job in this run?", "", candidates)
 	if err != nil {
 		return nil, err
 	}
@@ -461,68 +542,39 @@ func promptForJob(cs *iostreams.ColorScheme, jobs []shared.Job) (*shared.Job, er
 	return nil, nil
 }
 
-func logFilenameRegexp(job shared.Job, step shared.Step) *regexp.Regexp {
-	re := fmt.Sprintf(`%s\/%d_.*\.txt`, regexp.QuoteMeta(job.Name), step.Number)
-	return regexp.MustCompile(re)
-}
-
-// This function takes a zip file of logs and a list of jobs.
-// Structure of zip file
-// zip/
-// ├── jobname1/
-// │   ├── 1_stepname.txt
-// │   ├── 2_anotherstepname.txt
-// │   ├── 3_stepstepname.txt
-// │   └── 4_laststepname.txt
-// └── jobname2/
-//     ├── 1_stepname.txt
-//     └── 2_somestepname.txt
-// It iterates through the list of jobs and trys to find the matching
-// log in the zip file. If the matching log is found it is attached
-// to the job.
-func attachRunLog(rlz *zip.ReadCloser, jobs []shared.Job) {
-	for i, job := range jobs {
-		for j, step := range job.Steps {
-			re := logFilenameRegexp(job, step)
-			for _, file := range rlz.File {
-				if re.MatchString(file.Name) {
-					jobs[i].Steps[j].Log = file
-					break
-				}
-			}
+func displayLogSegments(w io.Writer, segments []logSegment) error {
+	for _, segment := range segments {
+		stepName := "UNKNOWN STEP"
+		if segment.step != nil {
+			stepName = segment.step.Name
 		}
-	}
-}
 
-func displayRunLog(io *iostreams.IOStreams, jobs []shared.Job, failed bool) error {
-	err := io.StartPager()
-	if err != nil {
-		return err
-	}
-	defer io.StopPager()
+		rc, err := segment.fetcher.GetLog()
+		if err != nil {
+			return err
+		}
 
-	for _, job := range jobs {
-		steps := job.Steps
-		sort.Sort(steps)
-		for _, step := range steps {
-			if failed && !shared.IsFailureState(step.Conclusion) {
-				continue
-			}
-			if step.Log == nil {
-				continue
-			}
-			prefix := fmt.Sprintf("%s\t%s\t", job.Name, step.Name)
-			f, err := step.Log.Open()
-			if err != nil {
+		err = func() error {
+			defer rc.Close()
+			prefix := fmt.Sprintf("%s\t%s\t", segment.job.Name, stepName)
+			if err := copyLogWithLinePrefix(w, rc, prefix); err != nil {
 				return err
 			}
-			scanner := bufio.NewScanner(f)
-			for scanner.Scan() {
-				fmt.Fprintf(io.Out, "%s%s\n", prefix, scanner.Text())
-			}
-			f.Close()
+			return nil
+		}()
+
+		if err != nil {
+			return err
 		}
 	}
 
+	return nil
+}
+
+func copyLogWithLinePrefix(w io.Writer, r io.Reader, prefix string) error {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		fmt.Fprintf(w, "%s%s\n", prefix, scanner.Text())
+	}
 	return nil
 }

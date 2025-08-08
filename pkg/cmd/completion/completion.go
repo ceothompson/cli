@@ -1,7 +1,6 @@
 package completion
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/MakeNowJust/heredoc"
@@ -34,7 +33,7 @@ func NewCmdCompletion(io *iostreams.IOStreams) *cobra.Command {
 			After, add this to your %[1]s~/.bash_profile%[1]s:
 
 				eval "$(gh completion -s bash)"
-			
+
 			### zsh
 
 			Generate a %[1]s_gh%[1]s completion script and put it somewhere in your %[1]s$fpath%[1]s:
@@ -45,7 +44,7 @@ func NewCmdCompletion(io *iostreams.IOStreams) *cobra.Command {
 
 				autoload -U compinit
 				compinit -i
-			
+
 			Zsh version 5.7 or later is recommended.
 
 			### fish
@@ -60,7 +59,7 @@ func NewCmdCompletion(io *iostreams.IOStreams) *cobra.Command {
 
 				mkdir -Path (Split-Path -Parent $profile) -ErrorAction SilentlyContinue
 				notepad $profile
-			
+
 			Add the line and save the file:
 
 				Invoke-Expression -Command $(gh completion -s powershell | Out-String)
@@ -68,7 +67,7 @@ func NewCmdCompletion(io *iostreams.IOStreams) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if shellType == "" {
 				if io.IsStdoutTTY() {
-					return &cmdutil.FlagError{Err: errors.New("error: the value for `--shell` is required")}
+					return cmdutil.FlagErrorf("error: the value for `--shell` is required")
 				}
 				shellType = "bash"
 			}
@@ -93,8 +92,7 @@ func NewCmdCompletion(io *iostreams.IOStreams) *cobra.Command {
 	}
 
 	cmdutil.DisableAuthCheck(cmd)
-
-	cmd.Flags().StringVarP(&shellType, "shell", "s", "", "Shell type: {bash|zsh|fish|powershell}")
+	cmdutil.StringEnumFlag(cmd, &shellType, "shell", "s", "", []string{"bash", "zsh", "fish", "powershell"}, "Shell type")
 
 	return cmd
 }

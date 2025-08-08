@@ -1,29 +1,26 @@
 package transfer
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/config"
-	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/pkg/cmd/issue/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/shurcooL/githubv4"
-	"github.com/shurcooL/graphql"
 	"github.com/spf13/cobra"
 )
 
 type TransferOptions struct {
 	HttpClient func() (*http.Client, error)
-	Config     func() (config.Config, error)
+	Config     func() (gh.Config, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
 
-	IssueSelector    string
+	IssueNumber      int
 	DestRepoSelector string
 }
 
@@ -39,8 +36,23 @@ func NewCmdTransfer(f *cmdutil.Factory, runF func(*TransferOptions) error) *cobr
 		Short: "Transfer issue to another repository",
 		Args:  cmdutil.ExactArgs(2, "issue and destination repository are required"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			opts.BaseRepo = f.BaseRepo
-			opts.IssueSelector = args[0]
+			issueNumber, baseRepo, err := shared.ParseIssueFromArg(args[0])
+			if err != nil {
+				return err
+			}
+
+			// If the args provided the base repo then use that directly.
+			if baseRepo, present := baseRepo.Value(); present {
+				opts.BaseRepo = func() (ghrepo.Interface, error) {
+					return baseRepo, nil
+				}
+			} else {
+				// support `-R, --repo` override
+				opts.BaseRepo = f.BaseRepo
+			}
+
+			opts.IssueNumber = issueNumber
+
 			opts.DestRepoSelector = args[1]
 
 			if runF != nil {
@@ -60,13 +72,20 @@ func transferRun(opts *TransferOptions) error {
 		return err
 	}
 
-	apiClient := api.NewClientFromHTTP(httpClient)
-	issue, _, err := shared.IssueFromArg(apiClient, opts.BaseRepo, opts.IssueSelector)
+	baseRepo, err := opts.BaseRepo()
 	if err != nil {
 		return err
 	}
 
-	destRepo, err := ghrepo.FromFullName(opts.DestRepoSelector)
+	issue, err := shared.FindIssueOrPR(httpClient, baseRepo, opts.IssueNumber, []string{"id", "number"})
+	if err != nil {
+		return err
+	}
+	if issue.IsPullRequest() {
+		return fmt.Errorf("issue %s#%d is a pull request and cannot be transferred", ghrepo.FullName(baseRepo), issue.Number)
+	}
+
+	destRepo, err := ghrepo.FromFullNameWithHost(opts.DestRepoSelector, baseRepo.RepoHost())
 	if err != nil {
 		return err
 	}
@@ -108,7 +127,7 @@ func issueTransfer(httpClient *http.Client, issueID string, destRepo ghrepo.Inte
 		},
 	}
 
-	gql := graphql.NewClient(ghinstance.GraphQLEndpoint(destRepo.RepoHost()), httpClient)
-	err := gql.MutateNamed(context.Background(), "IssueTransfer", &mutation, variables)
+	gql := api.NewClientFromHTTP(httpClient)
+	err := gql.Mutate(destRepo.RepoHost(), "IssueTransfer", &mutation, variables)
 	return mutation.TransferIssue.Issue.URL, err
 }

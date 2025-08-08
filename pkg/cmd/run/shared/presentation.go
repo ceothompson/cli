@@ -7,14 +7,19 @@ import (
 	"github.com/cli/cli/v2/pkg/iostreams"
 )
 
-func RenderRunHeader(cs *iostreams.ColorScheme, run Run, ago, prNumber string) string {
+func RenderRunHeader(cs *iostreams.ColorScheme, run Run, ago, prNumber string, attempt uint64) string {
 	title := fmt.Sprintf("%s %s%s",
-		cs.Bold(run.HeadBranch), run.Name, prNumber)
+		cs.Bold(run.HeadBranch), run.WorkflowName(), prNumber)
 	symbol, symbolColor := Symbol(cs, run.Status, run.Conclusion)
 	id := cs.Cyanf("%d", run.ID)
 
+	attemptLabel := ""
+	if attempt > 0 {
+		attemptLabel = fmt.Sprintf(" (Attempt #%d)", attempt)
+	}
+
 	header := ""
-	header += fmt.Sprintf("%s %s · %s\n", symbolColor(symbol), title, id)
+	header += fmt.Sprintf("%s %s · %s%s\n", symbolColor(symbol), title, id, attemptLabel)
 	header += fmt.Sprintf("Triggered via %s %s", run.Event, ago)
 
 	return header
@@ -42,12 +47,55 @@ func RenderJobs(cs *iostreams.ColorScheme, jobs []Job, verbose bool) string {
 	return strings.Join(lines, "\n")
 }
 
+func RenderJobsCompact(cs *iostreams.ColorScheme, jobs []Job) string {
+	lines := []string{}
+	for _, job := range jobs {
+		elapsed := job.CompletedAt.Sub(job.StartedAt)
+		elapsedStr := fmt.Sprintf(" in %s", elapsed)
+		if elapsed < 0 {
+			elapsedStr = ""
+		}
+		symbol, symbolColor := Symbol(cs, job.Status, job.Conclusion)
+		id := cs.Cyanf("%d", job.ID)
+		lines = append(lines, fmt.Sprintf("%s %s%s (ID %s)", symbolColor(symbol), cs.Bold(job.Name), elapsedStr, id))
+
+		if job.Status == Completed && job.Conclusion == Success {
+			continue
+		}
+
+		var inProgressStepLine string
+		var failedStepLines []string
+
+		for _, step := range job.Steps {
+			stepSymbol, stepSymColor := Symbol(cs, step.Status, step.Conclusion)
+			stepLine := fmt.Sprintf("  %s %s", stepSymColor(stepSymbol), step.Name)
+
+			if IsFailureState(step.Conclusion) {
+				failedStepLines = append(failedStepLines, stepLine)
+			}
+
+			if step.Status == InProgress {
+				inProgressStepLine = stepLine
+			}
+		}
+
+		lines = append(lines, failedStepLines...)
+
+		if inProgressStepLine != "" {
+			lines = append(lines, inProgressStepLine)
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 func RenderAnnotations(cs *iostreams.ColorScheme, annotations []Annotation) string {
 	lines := []string{}
 
 	for _, a := range annotations {
 		lines = append(lines, fmt.Sprintf("%s %s", AnnotationSymbol(cs, a), a.Message))
-		lines = append(lines, cs.Grayf("%s: %s#%d\n", a.JobName, a.Path, a.StartLine))
+		// Following newline is essential for spacing between annotations
+		lines = append(lines, cs.Mutedf("%s: %s#%d\n", a.JobName, a.Path, a.StartLine))
 	}
 
 	return strings.Join(lines, "\n")

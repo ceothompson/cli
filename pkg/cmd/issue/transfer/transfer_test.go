@@ -2,11 +2,12 @@ package transfer
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"testing"
 
 	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/httpmock"
@@ -14,17 +15,18 @@ import (
 	"github.com/cli/cli/v2/test"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func runCommand(rt http.RoundTripper, cli string) (*test.CmdOut, error) {
-	io, _, stdout, stderr := iostreams.Test()
+	ios, _, stdout, stderr := iostreams.Test()
 
 	factory := &cmdutil.Factory{
-		IOStreams: io,
+		IOStreams: ios,
 		HttpClient: func() (*http.Client, error) {
 			return &http.Client{Transport: rt}, nil
 		},
-		Config: func() (config.Config, error) {
+		Config: func() (gh.Config, error) {
 			return config.NewBlankConfig(), nil
 		},
 		BaseRepo: func() (ghrepo.Interface, error) {
@@ -32,7 +34,7 @@ func runCommand(rt http.RoundTripper, cli string) (*test.CmdOut, error) {
 		},
 	}
 
-	io.SetStdoutTTY(true)
+	ios.SetStdoutTTY(true)
 
 	cmd := NewCmdTransfer(factory, nil)
 
@@ -43,8 +45,8 @@ func runCommand(rt http.RoundTripper, cli string) (*test.CmdOut, error) {
 	cmd.SetArgs(argv)
 
 	cmd.SetIn(&bytes.Buffer{})
-	cmd.SetOut(ioutil.Discard)
-	cmd.SetErr(ioutil.Discard)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
 
 	_, err = cmd.ExecuteC()
 
@@ -56,18 +58,49 @@ func runCommand(rt http.RoundTripper, cli string) (*test.CmdOut, error) {
 
 func TestNewCmdTransfer(t *testing.T) {
 	tests := []struct {
-		name    string
-		cli     string
-		wants   TransferOptions
-		wantErr string
+		name         string
+		cli          string
+		wants        TransferOptions
+		wantBaseRepo ghrepo.Interface
+		wantErr      bool
 	}{
 		{
-			name: "issue name",
-			cli:  "3252 OWNER/REPO",
+			name:    "no argument",
+			cli:     "",
+			wantErr: true,
+		},
+		{
+			name: "issue number argument",
+			cli:  "--repo cli/repo 23 OWNER/REPO",
 			wants: TransferOptions{
-				IssueSelector:    "3252",
+				IssueNumber:      23,
 				DestRepoSelector: "OWNER/REPO",
 			},
+			wantBaseRepo: ghrepo.New("cli", "repo"),
+		},
+		{
+			name: "argument is hash prefixed number",
+			// Escaping is required here to avoid what I think is shellex treating it as a comment.
+			cli: "--repo cli/repo \\#23 OWNER/REPO",
+			wants: TransferOptions{
+				IssueNumber:      23,
+				DestRepoSelector: "OWNER/REPO",
+			},
+			wantBaseRepo: ghrepo.New("cli", "repo"),
+		},
+		{
+			name: "argument is a URL",
+			cli:  "https://github.com/cli/cli/issues/23 OWNER/REPO",
+			wants: TransferOptions{
+				IssueNumber:      23,
+				DestRepoSelector: "OWNER/REPO",
+			},
+			wantBaseRepo: ghrepo.New("cli", "cli"),
+		},
+		{
+			name:    "argument cannot be parsed to an issue",
+			cli:     "unparseable OWNER/REPO",
+			wantErr: true,
 		},
 	}
 
@@ -83,15 +116,29 @@ func TestNewCmdTransfer(t *testing.T) {
 				gotOpts = opts
 				return nil
 			})
+			cmdutil.EnableRepoOverride(cmd, f)
+
 			cmd.SetArgs(argv)
 			cmd.SetIn(&bytes.Buffer{})
 			cmd.SetOut(&bytes.Buffer{})
 			cmd.SetErr(&bytes.Buffer{})
 
 			_, cErr := cmd.ExecuteC()
-			assert.NoError(t, cErr)
-			assert.Equal(t, tt.wants.IssueSelector, gotOpts.IssueSelector)
+			if tt.wantErr {
+				require.Error(t, cErr)
+				return
+			}
+
+			require.NoError(t, cErr)
+			assert.Equal(t, tt.wants.IssueNumber, gotOpts.IssueNumber)
 			assert.Equal(t, tt.wants.DestRepoSelector, gotOpts.DestRepoSelector)
+			actualBaseRepo, err := gotOpts.BaseRepo()
+			require.NoError(t, err)
+			assert.True(
+				t,
+				ghrepo.IsSame(tt.wantBaseRepo, actualBaseRepo),
+				"expected base repo %+v, got %+v", tt.wantBaseRepo, actualBaseRepo,
+			)
 		})
 	}
 }
@@ -124,9 +171,9 @@ func Test_transferRunSuccessfulIssueTransfer(t *testing.T) {
 	http.Register(
 		httpmock.GraphQL(`query RepositoryInfo\b`),
 		httpmock.StringResponse(`
-				{ "data": { "repository": { 
+				{ "data": { "repository": {
 						"id": "dest-id",
-						"name": "REPO1", 
+						"name": "REPO1",
 						"owner": { "login": "OWNER1" },
 						"viewerPermission": "WRITE",
 						"hasIssuesEnabled": true
